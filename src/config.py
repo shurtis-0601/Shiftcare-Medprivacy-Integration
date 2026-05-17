@@ -38,6 +38,12 @@ class Config:
         # If blank, notification falls back to Cloud Logging only.
         self.gmail_sender: str = os.environ.get("GMAIL_SENDER_EMAIL", "")
 
+        # OAuth2 desktop credentials
+        self.oauth_client_secrets_path: str = os.environ.get(
+            "OAUTH_CLIENT_SECRETS_PATH", "client_secrets.json"
+        )
+        self.oauth_token_path: str = os.environ.get("OAUTH_TOKEN_PATH", "token.json")
+
         # GCP
         self.dlp_location: str = os.environ.get("DLP_LOCATION", "global")
         self.timezone: str = os.environ.get("TIMEZONE", "Australia/Melbourne")

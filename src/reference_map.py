@@ -27,7 +27,7 @@ from typing import Optional
 
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
-from google.auth import default as google_auth_default
+from src.auth import get_credentials
 
 logger = logging.getLogger(__name__)
 
@@ -49,8 +49,9 @@ class ReferenceMap:
 
     def __init__(self, config) -> None:
         self._sheet_id = config.reference_map_sheet_id
-        creds, _ = google_auth_default(
-            scopes=["https://www.googleapis.com/auth/spreadsheets"]
+        creds = get_credentials(
+            client_secrets_path=config.oauth_client_secrets_path,
+            token_path=config.oauth_token_path,
         )
         self._svc = build("sheets", "v4", credentials=creds, cache_discovery=False)
 

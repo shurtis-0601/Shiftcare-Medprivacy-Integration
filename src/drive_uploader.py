@@ -12,7 +12,7 @@ import logging
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaIoBaseUpload
-from google.auth import default as google_auth_default
+from src.auth import get_credentials
 
 logger = logging.getLogger(__name__)
 
@@ -25,8 +25,9 @@ class DriveUploader:
         self._pending_folder_id = config.drive_pending_folder_id
         self._quarantine_folder_id = config.drive_quarantine_folder_id
 
-        creds, _ = google_auth_default(
-            scopes=["https://www.googleapis.com/auth/drive.file"]
+        creds = get_credentials(
+            client_secrets_path=config.oauth_client_secrets_path,
+            token_path=config.oauth_token_path,
         )
         self._svc = build("drive", "v3", credentials=creds, cache_discovery=False)
 
