@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+
+# Credentials and secrets — NEVER commit these
+.env
+.medprivacy.lic
+*.json
+!package.json
+
+# Local pipeline data — contains identified participant data
+input/
+processed/
+logs/
+screenshots/
+pipeline.log
+
+# Virtual environments
+.venv/
+venv/
+
+# OS
+.DS_Store
+Thumbs.db
