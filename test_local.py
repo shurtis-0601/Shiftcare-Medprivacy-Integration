@@ -229,7 +229,9 @@ class TestDeidentifier(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class TestIntegration(unittest.TestCase):
-    @unittest.skipUnless(os.environ.get("INTEGRATION") == "1", "Set INTEGRATION=1 to run")
+    @unittest.skip(
+        "ShiftCare API not available on basic plan - pipeline uses CSV ingestion instead"
+    )
     def test_shiftcare_connection(self):
         """Verifies ShiftCare API key and that the clients endpoint responds."""
         from src.config import Config
