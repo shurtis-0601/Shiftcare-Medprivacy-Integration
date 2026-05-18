@@ -26,6 +26,9 @@ class Config:
         self.notification_email: str = os.environ["NOTIFICATION_EMAIL"]
         self.gmail_sender: str = os.environ.get("GMAIL_SENDER_EMAIL", "")
 
+        # Input folder for CSV files produced by the Playwright scraper
+        self.input_folder: str = os.environ.get("INPUT_FOLDER", "input")
+
         # OAuth2 desktop credentials
         self.oauth_client_secrets_path: str = os.environ.get(
             "OAUTH_CLIENT_SECRETS_PATH", "client_secrets.json"

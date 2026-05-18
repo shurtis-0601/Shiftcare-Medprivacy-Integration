@@ -25,17 +25,18 @@ import logging
 import os
 from collections import defaultdict
 from datetime import date, datetime, timedelta
+from pathlib import Path
 
 import functions_framework
 import pytz
 
 from src.config import Config
+from src.csv_ingestor import load_from_csv
 from src.deidentifier import MedPrivacyDeidentifier
 from src.drive_uploader import DriveUploader
 from src.notifier import Notifier
 from src.pii_csv_loader import load_from_config as load_supplementary_pii
 from src.reference_map import ReferenceMap
-from src.shiftcare_client import ShiftCareClient
 
 # Cloud Logging picks up the standard logging module automatically when running
 # inside a Cloud Function.  For local runs it falls back to stderr.
@@ -89,7 +90,6 @@ def _run(config: Config, target_date: date | None = None) -> dict:
 
     logger.info("Pipeline starting for date: %s", target_date)
 
-    shiftcare = ShiftCareClient(config)
     ref_map = ReferenceMap(config)
     deidentifier = MedPrivacyDeidentifier()
     uploader = DriveUploader(config)
@@ -101,10 +101,24 @@ def _run(config: Config, target_date: date | None = None) -> dict:
     # ---- Load supplementary PII from master CSV in Google Drive ----
     supplementary_pii = load_supplementary_pii(config)
 
-    # ---- Fetch ShiftCare data ----
-    clients: dict = shiftcare.get_clients()
-    staff: list[dict] = shiftcare.get_employees()
-    notes: list[dict] = shiftcare.get_service_notes(target_date, target_date)
+    # ---- Read notes from CSV files placed in the input folder by the scraper ----
+    input_folder = Path(config.input_folder)
+    csv_files = sorted(input_folder.glob("*.csv"))
+    if not csv_files:
+        logger.warning("No CSV files found in %s — nothing to process", input_folder)
+        return {"total": 0}
+
+    clients: dict = {}
+    _staff_seen: dict[str, dict] = {}
+    notes: list[dict] = []
+    for csv_path in csv_files:
+        c, s, n = load_from_csv(csv_path, target_date)
+        clients.update(c)
+        notes.extend(n)
+        for member in s:
+            key = f"{member['first_name']} {member['last_name']}".lower()
+            _staff_seen[key] = member
+    staff: list[dict] = list(_staff_seen.values())
 
     stats: dict = defaultdict(int)
     stats["total"] = len(notes)

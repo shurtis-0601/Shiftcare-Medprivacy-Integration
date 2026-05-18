@@ -252,27 +252,56 @@ class TestIntegration(unittest.TestCase):
         ref_map.load()
         print(f"\nReference map: {len(ref_map.get_all_participants())} participants loaded")
 
-    @unittest.skipUnless(os.environ.get("INTEGRATION") == "1", "Set INTEGRATION=1 to run")
     def test_full_pipeline_dry_run(self):
         """
-        Runs the pipeline for yesterday but patches the Drive uploader so no
-        files are actually written to Google Drive.
+        Runs the pipeline end-to-end against a sample CSV in a temp input folder.
+        All external services (Drive, Sheets, supplementary PII) are mocked so
+        no API credentials are required.
         """
+        import tempfile
         import main
-        from src.config import Config
 
-        config = Config()
+        target_date = date(2025, 1, 15)
+        csv_content = (
+            "Date,First Name,Last Name,Note,Support Worker,NDIS Number,Date of Birth\n"
+            "15/01/2025,Jane,Smith,"
+            "Jane attended the session and engaged well with activities.,"
+            "Alex Worker,430123456,15/03/1985\n"
+        )
 
-        with patch("main.DriveUploader") as MockUploader:
-            mock_upload = MagicMock()
-            mock_upload.upload_to_pending.return_value = "DRYRUN_FILE_ID"
-            mock_upload.upload_to_quarantine.return_value = "DRYRUN_QUARANTINE_ID"
-            MockUploader.return_value = mock_upload
+        with tempfile.TemporaryDirectory() as tmpdir:
+            csv_path = os.path.join(tmpdir, "notes.csv")
+            with open(csv_path, "w", encoding="utf-8") as fh:
+                fh.write(csv_content)
 
-            stats = main._run(config)
+            config = MagicMock()
+            config.input_folder = tmpdir
+            config.timezone = "Australia/Melbourne"
+
+            with patch("main.DriveUploader") as MockUploader, \
+                 patch("main.ReferenceMap") as MockRefMap, \
+                 patch("main.Notifier"), \
+                 patch("main.load_supplementary_pii") as mock_pii:
+
+                mock_uploader = MagicMock()
+                mock_uploader.upload_to_pending.return_value = "DRYRUN_FILE_ID"
+                mock_uploader.upload_to_quarantine.return_value = "DRYRUN_QUARANTINE_ID"
+                MockUploader.return_value = mock_uploader
+
+                mock_ref = MagicMock()
+                mock_ref.get_all_participants.return_value = []
+                mock_ref.is_note_processed.return_value = False
+                mock_ref.get_or_create_code.return_value = "PART-001"
+                MockRefMap.return_value = mock_ref
+
+                mock_pii.return_value = MagicMock(is_empty=True)
+
+                stats = main._run(config, target_date=target_date)
 
         print(f"\nDry-run pipeline stats: {json.dumps(stats, indent=2)}")
         self.assertIn("total", stats)
+        self.assertEqual(stats["total"], 1)
+        self.assertEqual(stats.get("uploaded", 0), 1)
 
 
 # ---------------------------------------------------------------------------
