@@ -7,18 +7,19 @@ Entry points:
 
 The pipeline:
   1. Determines yesterday's date in the Melbourne timezone.
-  2. Fetches all active ShiftCare participants (clients) and staff.
-  3. Fetches all service/case notes for that date.
-  4. For each note:
+  2. Reads input from the configured input folder:
+       PDF mode  — one YYYY-MM-DD-PART-XXX.pdf per participant (produced by the
+                   Playwright scraper).  ref_code is taken from the filename.
+       CSV mode  — fallback; structured export from csv_ingestor.  ref_code is
+                   resolved via the reference map.
+  3. For each note:
        a. Looks up (or creates) the participant's PART-NNN reference code.
-       b. Runs the MedPrivacy de-identification engine — substitutes all known
-          PII with reference codes / redaction tags, then verifies the output
-          is clean before writing it anywhere.
+       b. Runs the MedPrivacy de-identification engine.
        c. Uploads the clean note to Google Drive (Pending folder) or, if
           de-identification verification fails, to the Quarantine folder.
        d. Logs the result to the Processed Notes sheet (idempotency).
-  5. Saves any new reference-code assignments back to the Reference Codes sheet.
-  6. Sends an email notification if any notes were quarantined or errored.
+  4. Saves any new reference-code assignments back to the Reference Codes sheet.
+  5. Sends an email notification if any notes were quarantined or errored.
 """
 
 import logging
@@ -35,11 +36,10 @@ from src.csv_ingestor import load_from_csv
 from src.deidentifier import MedPrivacyDeidentifier
 from src.drive_uploader import DriveUploader
 from src.notifier import Notifier
+from src.pdf_ingestor import iter_pdfs
 from src.pii_csv_loader import load_from_config as load_supplementary_pii
 from src.reference_map import ReferenceMap
 
-# Cloud Logging picks up the standard logging module automatically when running
-# inside a Cloud Function.  For local runs it falls back to stderr.
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s — %(message)s",
@@ -62,8 +62,6 @@ def run_pipeline_scheduled(cloud_event):
 def run_pipeline_http(request):
     """HTTP trigger — for manual runs and local testing."""
     config = Config()
-
-    # Allow overriding the target date via ?date=YYYY-MM-DD for back-fills
     raw_date = request.args.get("date") if request.args else None
     target_date = None
     if raw_date:
@@ -71,7 +69,6 @@ def run_pipeline_http(request):
             target_date = date.fromisoformat(raw_date)
         except ValueError:
             return f"Invalid date format: {raw_date!r}. Use YYYY-MM-DD.", 400
-
     stats = _run(config, target_date=target_date)
     return {
         "status": "ok",
@@ -95,30 +92,56 @@ def _run(config: Config, target_date: date | None = None) -> dict:
     uploader = DriveUploader(config)
     notifier = Notifier(config)
 
-    # ---- Load reference map (participants seen so far + processed note log) ----
     ref_map.load()
-
-    # ---- Load supplementary PII from master CSV in Google Drive ----
     supplementary_pii = load_supplementary_pii(config)
 
-    # ---- Read notes from CSV files placed in the input folder by the scraper ----
+    # ---- Build a unified notes list from PDFs (preferred) or CSVs (fallback) ----
     input_folder = Path(config.input_folder)
+    notes: list[dict] = []
+    staff: list[dict] = []
+
+    pdf_files = sorted(input_folder.glob("*.pdf"))
     csv_files = sorted(input_folder.glob("*.csv"))
-    if not csv_files:
-        logger.warning("No CSV files found in %s — nothing to process", input_folder)
+
+    if pdf_files:
+        # PDF mode: one file per participant, ref_code embedded in filename.
+        # The scraper assigns PART-XXX codes via the reference map before downloading,
+        # so get_or_create_code() is not called here.
+        for ref_code, report_date, text, path in iter_pdfs(input_folder):
+            notes.append({
+                "id": path.stem,           # "2025-01-15-PART-001" — stable across runs
+                "ref_code": ref_code,
+                "note": text,
+                "created_at": report_date.isoformat(),
+            })
+        logger.info("PDF mode: %d note(s) from %d file(s)", len(notes), len(pdf_files))
+
+    elif csv_files:
+        # CSV mode: structured export; resolve ref_codes via the reference map.
+        _staff_seen: dict[str, dict] = {}
+        clients: dict = {}
+        _raw_notes: list[dict] = []
+        for csv_path in csv_files:
+            c, s, n = load_from_csv(csv_path, target_date)
+            clients.update(c)
+            _raw_notes.extend(n)
+            for member in s:
+                key = f"{member['first_name']} {member['last_name']}".lower()
+                _staff_seen[key] = member
+        staff = list(_staff_seen.values())
+        for note in _raw_notes:
+            client_id = note.get("client_id", "")
+            client_data = clients.get(client_id, {})
+            note["ref_code"] = ref_map.get_or_create_code(client_id, client_data)
+            notes.append(note)
+        logger.info("CSV mode: %d note(s) from %d file(s)", len(notes), len(csv_files))
+
+    else:
+        logger.warning("No PDF or CSV files found in %s — nothing to process", input_folder)
         return {"total": 0}
 
-    clients: dict = {}
-    _staff_seen: dict[str, dict] = {}
-    notes: list[dict] = []
-    for csv_path in csv_files:
-        c, s, n = load_from_csv(csv_path, target_date)
-        clients.update(c)
-        notes.extend(n)
-        for member in s:
-            key = f"{member['first_name']} {member['last_name']}".lower()
-            _staff_seen[key] = member
-    staff: list[dict] = list(_staff_seen.values())
+    # Build participant context after all ref codes are resolved
+    all_participants = ref_map.get_all_participants()
 
     stats: dict = defaultdict(int)
     stats["total"] = len(notes)
@@ -128,31 +151,21 @@ def _run(config: Config, target_date: date | None = None) -> dict:
     # ---- Process each note ----
     for note in notes:
         note_id = note.get("id")
-        client_id = note.get("client_id")
+        ref_code = note.get("ref_code")
         note_text = (note.get("note") or "").strip()
+        created_at = note.get("created_at", str(target_date))[:10]
 
         if not note_text:
             stats["skipped"] += 1
             logger.info("Note %s has no text body — skipping", note_id)
             continue
 
-        # Idempotency: skip if already processed in a previous run
         if ref_map.is_note_processed(note_id):
             stats["skipped"] += 1
             logger.info("Note %s already processed — skipping", note_id)
             continue
 
         try:
-            client_data = clients.get(client_id, {})
-
-            # Assign / retrieve reference code for this participant
-            ref_code = ref_map.get_or_create_code(client_id, client_data)
-
-            # Build full participant context for the deidentifier
-            # (all known participants so cross-mentions in notes are also redacted)
-            all_participants = ref_map.get_all_participants()
-
-            # De-identify
             result = deidentifier.deidentify(
                 text=note_text,
                 participants=all_participants,
@@ -160,7 +173,6 @@ def _run(config: Config, target_date: date | None = None) -> dict:
                 supplementary_pii=supplementary_pii,
             )
 
-            created_at = note.get("created_at", str(target_date))[:10]  # YYYY-MM-DD
             filename = f"{created_at}_{ref_code}_note_{note_id}"
 
             if result.is_quarantined:
@@ -201,15 +213,10 @@ def _run(config: Config, target_date: date | None = None) -> dict:
     # ---- Persist new reference-code assignments ----
     ref_map.save()
 
-    # ---- Notify if anything needs human attention ----
     if quarantined or errors:
         notifier.send_pipeline_report(target_date, dict(stats), quarantined, errors)
 
-    logger.info(
-        "Pipeline complete for %s — %s",
-        target_date,
-        dict(stats),
-    )
+    logger.info("Pipeline complete for %s — %s", target_date, dict(stats))
     return dict(stats)
 
 

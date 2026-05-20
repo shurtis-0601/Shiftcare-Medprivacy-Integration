@@ -2,16 +2,16 @@
 Local / Windows Task Scheduler runner for the ShiftCare → MedPrivacy pipeline.
 
 Orchestrates:
-  1. Browser scrape of ShiftCare (unless --skip-scrape)
-  2. CSV ingestion
-  3. De-identification via main._run()
-  4. CSV archival to processed/
-  5. Run log (local CSV + Drive upload)
+  1. Browser scrape of ShiftCare Events page — one PDF per participant
+     (unless --skip-scrape)
+  2. De-identification via main._run()  (reads PDFs from input/)
+  3. PDF archival to processed/
+  4. Run log (local CSV + optional Drive upload)
 
 Run manually:
-    python run_local.py
-    python run_local.py --date 2025-05-16
-    python run_local.py --skip-scrape   # use an existing CSV in input/
+    python src/run_local.py
+    python src/run_local.py --date 2025-05-16
+    python src/run_local.py --skip-scrape   # process PDFs already in input/
 """
 
 # ---------------------------------------------------------------------------
@@ -73,8 +73,8 @@ import pytz
 
 import main as pipeline_main
 from src.config import Config
-from src.csv_ingestor import load_from_csv, count_rows
 from src.notifier import Notifier
+from src.reference_map import ReferenceMap
 from src.run_logger import RunLogger
 from src.shiftcare_scraper import run_scraper
 
@@ -87,26 +87,26 @@ def _resolve_target_date(raw_date: date | None, config: Config) -> date:
     if raw_date is not None:
         return raw_date
     tz = pytz.timezone(config.timezone)
-    return (datetime.now(tz)).date() - __import__("datetime").timedelta(days=1)
+    import datetime as _dt
+    return (datetime.now(tz)).date() - _dt.timedelta(days=1)
 
 
-def _find_existing_csv(input_dir: Path, target_date: date) -> Path | None:
-    """Return path to a CSV for target_date if it already exists in input_dir."""
-    candidate = input_dir / f"service_notes_{target_date.isoformat()}.csv"
-    return candidate if candidate.exists() else None
+def _find_processed_pdfs(processed_dir: Path, target_date: date) -> list[Path]:
+    """Return any PDFs for target_date already in the processed/ folder."""
+    return list(processed_dir.glob(f"{target_date.isoformat()}-PART-*.pdf"))
 
 
-def _find_processed_csv(processed_dir: Path, target_date: date) -> Path | None:
-    candidate = processed_dir / f"service_notes_{target_date.isoformat()}.csv"
-    return candidate if candidate.exists() else None
+def _find_existing_pdfs(input_dir: Path, target_date: date) -> list[Path]:
+    """Return PDFs for target_date already in the input/ folder."""
+    return list(input_dir.glob(f"{target_date.isoformat()}-PART-*.pdf"))
 
 
-def _archive_csv(csv_path: Path, processed_dir: Path) -> Path:
+def _archive_pdfs(pdf_paths: list[Path], processed_dir: Path) -> None:
     processed_dir.mkdir(parents=True, exist_ok=True)
-    dest = processed_dir / csv_path.name
-    shutil.move(str(csv_path), str(dest))
-    logger.info("CSV archived to %s", dest)
-    return dest
+    for pdf in pdf_paths:
+        dest = processed_dir / pdf.name
+        shutil.move(str(pdf), str(dest))
+    logger.info("Archived %d PDF(s) to %s", len(pdf_paths), processed_dir)
 
 
 # ---------------------------------------------------------------------------
@@ -126,7 +126,7 @@ def main() -> None:
     parser.add_argument(
         "--skip-scrape",
         action="store_true",
-        help="Skip the Playwright scrape step (use an existing CSV in input/)",
+        help="Skip the Playwright scrape step (use PDFs already in input/)",
     )
     args = parser.parse_args()
 
@@ -137,7 +137,7 @@ def main() -> None:
     target_date = _resolve_target_date(args.date, config)
     logger.info("Pipeline starting for %s", target_date)
 
-    input_dir = Path(os.environ.get("PIPELINE_INPUT_DIR", "./input"))
+    input_dir = Path(os.environ.get("PIPELINE_INPUT_DIR", config.input_folder))
     processed_dir = Path(os.environ.get("PIPELINE_PROCESSED_DIR", "./processed"))
     log_dir = Path(os.environ.get("PIPELINE_LOG_DIR", "./logs"))
 
@@ -145,41 +145,44 @@ def main() -> None:
     notifier = Notifier(config)
 
     # ---- Idempotency: already fully processed? ----
-    if _find_processed_csv(processed_dir, target_date) is not None:
+    if _find_processed_pdfs(processed_dir, target_date):
         logger.info(
-            "CSV for %s already in processed/ folder — pipeline already ran for this date. "
-            "Exiting with 0 (note-level idempotency is also enforced by ReferenceMap).",
+            "PDFs for %s already in processed/ — pipeline already ran for this date. "
+            "Exiting with 0 (note-level idempotency also enforced by ReferenceMap).",
             target_date,
         )
         sys.exit(0)
 
-    # ---- Step 1: Scrape ----
-    csv_path: Path | None = None
+    # ---- Step 1: Load reference map (needed by scraper to assign PART-XXX codes) ----
+    ref_map = ReferenceMap(config)
+    ref_map.load()
+
+    # ---- Step 2: Scrape ----
+    pdf_paths: list[Path] = []
 
     if args.skip_scrape:
-        logger.info("--skip-scrape: looking for existing CSV in %s", input_dir)
-        csv_path = _find_existing_csv(input_dir, target_date)
-        if csv_path is None:
+        logger.info("--skip-scrape: looking for existing PDFs in %s", input_dir)
+        pdf_paths = _find_existing_pdfs(input_dir, target_date)
+        if not pdf_paths:
             logger.error(
-                "No CSV found for %s in %s. "
-                "Either run without --skip-scrape, or manually place the CSV there.",
-                target_date,
-                input_dir,
+                "No PDFs found for %s in %s. "
+                "Either run without --skip-scrape, or place the PDFs there manually.",
+                target_date, input_dir,
             )
             sys.exit(1)
+        logger.info("Found %d existing PDF(s) — skipping scrape", len(pdf_paths))
     else:
         sc_email = os.environ.get("SHIFTCARE_EMAIL", "")
         sc_password = os.environ.get("SHIFTCARE_PASSWORD", "")
         if not sc_email or not sc_password:
             logger.error(
                 "SHIFTCARE_EMAIL and SHIFTCARE_PASSWORD must be set in .env "
-                "to run the browser scrape. Use --skip-scrape if you have a CSV already."
+                "to run the browser scrape. Use --skip-scrape if you have PDFs already."
             )
             sys.exit(1)
 
-        # Returns None if CSV already exists (idempotency) — treat as already scraped
         try:
-            result = run_scraper(sc_email, sc_password, input_dir, target_date)
+            pdf_paths = run_scraper(sc_email, sc_password, input_dir, target_date, ref_map)
         except RuntimeError as exc:
             logger.error("Scraper failed: %s", exc)
             try:
@@ -204,57 +207,45 @@ def main() -> None:
             run_logger.upload_log(config)
             sys.exit(1)
 
-        if result is None:
-            # Scraper reported file already existed
-            csv_path = _find_existing_csv(input_dir, target_date)
-        else:
-            csv_path = result
+    if not pdf_paths:
+        logger.warning("No PDFs downloaded for %s — nothing to process.", target_date)
+        sys.exit(0)
 
-        if csv_path is None:
-            logger.error("Scraper returned no CSV path and no existing file found for %s.", target_date)
-            sys.exit(1)
+    # Save any new PART-XXX assignments made during the scrape so that main._run()
+    # can see them when it creates a fresh ReferenceMap and loads from the sheet.
+    ref_map.save()
 
-    notes_exported = count_rows(csv_path)
-    logger.info("CSV contains %d non-empty note rows: %s", notes_exported, csv_path)
+    logger.info("%d PDF(s) ready for processing", len(pdf_paths))
 
-    # ---- Step 2: Ingest CSV ----
-    clients, staff, notes = load_from_csv(csv_path, target_date)
+    # ---- Step 3: De-identify and upload to Drive ----
+    # main._run() creates its own ReferenceMap, loads from the sheet (which now
+    # includes the codes saved above), processes each PDF, and uploads to Drive.
+    logger.info("Starting de-identification pipeline")
+    stats = pipeline_main._run(config, target_date)
 
-    # ---- Step 3: Run de-identification pipeline ----
-    logger.info("Starting de-identification for %d notes", len(notes))
-    stats = pipeline_main._run(
-        config,
-        target_date,
-        clients=clients,
-        staff=staff,
-        notes=notes,
-    )
-
-    # ---- Step 4: Archive CSV ----
-    _archive_csv(csv_path, processed_dir)
+    # ---- Step 4: Archive PDFs ----
+    _archive_pdfs(pdf_paths, processed_dir)
 
     # ---- Step 5: Log run ----
-    error_list = [f"note_id={e.get('note_id')}: {e.get('error')}" for e in []]
-    # errors from _run aren't directly returned; use stats["errors"] count
     error_count = stats.get("errors", 0)
     error_msgs = [f"{error_count} note(s) errored — check pipeline.log"] if error_count else []
 
     run_logger.record_run(
         run_date=target_date,
         run_at=run_at,
-        notes_exported=notes_exported,
+        notes_exported=len(pdf_paths),
         notes_processed=stats.get("uploaded", 0),
         notes_quarantined=stats.get("quarantined", 0),
         notes_skipped=stats.get("skipped", 0),
         errors=error_msgs,
-        csv_path=str(csv_path.name),
+        csv_path=f"{len(pdf_paths)} PDF(s)",
     )
     run_logger.upload_log(config)
 
     # ---- Step 6: Summary ----
     print("\n" + "=" * 55)
     print(f"Pipeline complete for {target_date}")
-    print(f"  Exported from ShiftCare : {notes_exported}")
+    print(f"  PDFs scraped            : {len(pdf_paths)}")
     print(f"  Uploaded to Pending     : {stats.get('uploaded', 0)}")
     print(f"  Quarantined             : {stats.get('quarantined', 0)}")
     print(f"  Skipped (dup/empty)     : {stats.get('skipped', 0)}")
