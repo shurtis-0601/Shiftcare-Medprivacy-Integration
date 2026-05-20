@@ -29,6 +29,9 @@ from playwright.async_api import async_playwright, BrowserContext, Page
 
 logger = logging.getLogger(__name__)
 
+# URL fragments that indicate a 2FA / verification step
+_2FA_KEYWORDS = ("2fa", "two_factor", "two-factor", "verify", "otp", "mfa")
+
 
 # ---------------------------------------------------------------------------
 # Env-var helpers
@@ -65,7 +68,19 @@ async def _screenshot(page: Page, label: str) -> None:
 # Login
 # ---------------------------------------------------------------------------
 
-async def _login(page: Page, base_url: str, email: str, password: str, timeout_ms: int) -> None:
+async def _login(
+    page: Page,
+    context: BrowserContext,
+    base_url: str,
+    email: str,
+    password: str,
+    timeout_ms: int,
+) -> Page:
+    """
+    Run the full manual login flow.  Returns the active Page after login,
+    which may differ from the input page if ShiftCare opened a new tab
+    during the 2FA / verification step.
+    """
     sel_email = _env("SC_SEL_EMAIL", "input[type='email'], input[name='email'], #user_email")
     sel_password = _env("SC_SEL_PASSWORD", "input[type='password'], input[name='password'], #user_password")
     sel_submit = _env("SC_SEL_SUBMIT", "input[type='submit'], button[type='submit']")
@@ -184,34 +199,119 @@ async def _login(page: Page, base_url: str, email: str, password: str, timeout_m
         (await submit_btn.inner_text()).strip()[:60],
     )
 
+    # Track any new pages ShiftCare opens (2FA popup, redirect to new tab, etc.)
+    new_pages: list[Page] = []
+    context.on("page", lambda p: new_pages.append(p))
+
     await _screenshot(page, "02b_pre_submit")
     logger.info("Clicking Sign In — current URL: %s", page.url)
-    await submit_btn.click()
-    await _screenshot(page, "02c_post_submit_click")
-    logger.info("Sign In clicked — current URL: %s", page.url)
+    try:
+        await submit_btn.click()
+    except Exception as exc:  # pylint: disable=broad-except
+        # TargetClosedError can fire here if the page immediately navigates
+        # to a new context; log and continue — _resolve_active_page handles it.
+        logger.debug("Exception during submit click (may be expected): %s", exc)
 
     try:
-        await page.wait_for_url(lambda u: "sign_in" not in u, timeout=timeout_ms)
-    except Exception:
-        # Navigation didn't leave the sign-in page — scrape the error message
+        await _screenshot(page, "02c_post_submit_click")
+    except Exception:  # pylint: disable=broad-except
+        pass  # page may have already closed
+
+    # Find whichever page is now active (handles TargetClosedError / new tabs)
+    active_page = await _resolve_active_page(page, new_pages, context, timeout_ms)
+    logger.info("Post-submit active page: %s", active_page.url)
+
+    # ---- 2FA / verification pause ----
+    if any(kw in active_page.url.lower() for kw in _2FA_KEYWORDS):
+        await _screenshot(active_page, "04_2fa_page")
+        print(
+            "\n"
+            "┌─────────────────────────────────────────────────────────────┐\n"
+            "│  2FA / verification required.  Complete it in the browser,  │\n"
+            "│  then press Enter here to continue.                          │\n"
+            "└─────────────────────────────────────────────────────────────┘"
+        )
+        await asyncio.get_event_loop().run_in_executor(None, input)
+        try:
+            await active_page.wait_for_url(
+                lambda u: not any(kw in u.lower() for kw in _2FA_KEYWORDS),
+                timeout=timeout_ms,
+            )
+        except Exception:  # pylint: disable=broad-except
+            pass  # user may have already navigated; check URL below
+        await active_page.wait_for_load_state("networkidle", timeout=timeout_ms)
+        await _screenshot(active_page, "05_post_2fa")
+        logger.info("Post-2FA URL: %s", active_page.url)
+
+    # ---- Final check ----
+    if "sign_in" in active_page.url:
         error_text = ""
         for err_sel in (".alert", ".alert-danger", ".error", "#error_explanation",
                         "[class*='error']", "[class*='alert']", ".flash", "p.invalid"):
-            el = page.locator(err_sel).first
+            el = active_page.locator(err_sel).first
             if await el.count():
                 candidate = (await el.inner_text()).strip()
                 if candidate:
                     error_text = candidate
                     break
-        await _screenshot(page, "error_login_failed")
+        await _screenshot(active_page, "error_login_failed")
         raise RuntimeError(
-            f"Login did not complete — still on {page.url!r}. "
+            f"Login did not complete — still on {active_page.url!r}. "
             f"Page error: {error_text!r}. "
             "Check screenshots/ for browser state."
         ) from None
 
-    await _screenshot(page, "03_post_login")
-    logger.info("Login successful: %s", page.url)
+    await _screenshot(active_page, "03_post_login")
+    logger.info("Login successful: %s", active_page.url)
+    return active_page
+
+
+async def _resolve_active_page(
+    original_page: Page,
+    new_pages: list[Page],
+    context: BrowserContext,
+    timeout_ms: int,
+) -> Page:
+    """
+    After clicking Sign In, return whichever Page is now active.
+
+    Handles two failure modes:
+    - TargetClosedError: the original page was closed/replaced during the
+      redirect chain.  We find the new page from context.pages.
+    - New tab: ShiftCare opened a fresh page for 2FA.  We return the newest
+      page from the new_pages list captured by the context 'page' event.
+    """
+    try:
+        await original_page.wait_for_load_state("networkidle", timeout=timeout_ms)
+        return original_page
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.info(
+            "Original page unreachable after Sign In (%s) — locating new page",
+            type(exc).__name__,
+        )
+
+    await asyncio.sleep(1)  # give the new page a moment to appear
+
+    # Prefer pages captured by the context 'page' event, then any other
+    # surviving page in the context.
+    candidate: Page | None = new_pages[-1] if new_pages else None
+    if candidate is None:
+        others = [p for p in context.pages if p is not original_page]
+        candidate = others[-1] if others else (context.pages[-1] if context.pages else None)
+
+    if candidate is None:
+        raise RuntimeError(
+            "Original page closed after Sign In and no new page found. "
+            "Check screenshots/ for browser state."
+        )
+
+    try:
+        await candidate.wait_for_load_state("networkidle", timeout=timeout_ms)
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.warning("New page networkidle wait failed: %s", exc)
+
+    logger.info("Resolved active page: %s", candidate.url)
+    return candidate
 
 
 # ---------------------------------------------------------------------------
@@ -236,14 +336,11 @@ async def _ensure_logged_in(
     password: str,
     session_path: Path,
     timeout_ms: int,
-) -> None:
+) -> Page:
     """
     Restore a saved session if one exists and is still valid; otherwise run
-    the full manual login (with reCAPTCHA pause) and save the new session.
-
-    Session validity is checked by loading the cookies into the context and
-    navigating to the app root — if ShiftCare redirects to /users/sign_in the
-    session has expired and the full login flow runs instead.
+    the full manual login (with reCAPTCHA / 2FA pauses) and save the new
+    session.  Returns the active Page (may be a new page if 2FA opened a tab).
     """
     if session_path.exists():
         logger.info("Found session file: %s — attempting restore", session_path)
@@ -258,7 +355,7 @@ async def _ensure_logged_in(
 
             if "sign_in" not in page.url:
                 logger.info("Session valid — login skipped")
-                return
+                return page
 
             logger.info("Session expired (redirected to %s) — running full login", page.url)
         except Exception as exc:  # pylint: disable=broad-except
@@ -268,8 +365,9 @@ async def _ensure_logged_in(
     else:
         logger.info("No session file at %s — running full login", session_path)
 
-    await _login(page, base_url, email, password, timeout_ms)
+    active_page = await _login(page, context, base_url, email, password, timeout_ms)
     await _save_session(context, session_path)
+    return active_page
 
 
 # ---------------------------------------------------------------------------
@@ -579,7 +677,7 @@ async def scrape_all_participants(
         page = await context.new_page()
 
         try:
-            await _ensure_logged_in(page, context, base_url, email, password, session_path, timeout_ms)
+            page = await _ensure_logged_in(page, context, base_url, email, password, session_path, timeout_ms)
             await _navigate_to_events_page(page, base_url, timeout_ms)
             participant_links = await _get_participant_links(page)
             events_page_url = page.url
