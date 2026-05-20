@@ -5,6 +5,7 @@ __pycache__/
 dist/
 build/
 .eggs/
+pii_database.csv
 
 # Virtual environments
 .venv/
