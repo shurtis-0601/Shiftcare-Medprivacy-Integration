@@ -70,22 +70,62 @@ async def _login(page: Page, base_url: str, email: str, password: str, timeout_m
     sel_password = _env("SC_SEL_PASSWORD", "input[type='password'], input[name='password'], #user_password")
     sel_submit = _env("SC_SEL_SUBMIT", "input[type='submit'], button[type='submit']")
 
-    logger.info("Navigating to ShiftCare login")
+    logger.info("Navigating to ShiftCare login: %s/users/sign_in", base_url)
     await page.goto(f"{base_url}/users/sign_in", timeout=timeout_ms)
+    await page.wait_for_load_state("networkidle", timeout=timeout_ms)
     await _screenshot(page, "01_login_page")
+    logger.info("Login page loaded: %s", page.url)
 
+    # ---- Email field ----
     email_input = page.locator(sel_email).first
     if not await email_input.count():
-        raise RuntimeError("Could not find email input. Check SC_SEL_EMAIL.")
-    await email_input.fill(email)
+        raise RuntimeError(
+            f"Could not find email input using selector {sel_email!r}. "
+            "Check SC_SEL_EMAIL or see screenshots/."
+        )
+    logger.info(
+        "Email field — selector: %r  id=%r  name=%r  type=%r  placeholder=%r",
+        sel_email,
+        await email_input.get_attribute("id"),
+        await email_input.get_attribute("name"),
+        await email_input.get_attribute("type"),
+        await email_input.get_attribute("placeholder"),
+    )
+    # Use click + type (not fill) so React's onChange fires and its internal
+    # state is updated.  fill() sets the DOM value directly and bypasses
+    # synthetic input events, which causes Rails/React forms to submit blank.
+    await email_input.click()
+    await email_input.fill("")          # clear first
+    await email_input.type(email, delay=50)
+    readback = await email_input.input_value()
+    logger.info("Email typed: %r — readback: %r — match: %s", email, readback, readback == email)
 
+    # ---- Password field ----
     password_input = page.locator(sel_password).first
     if not await password_input.count():
-        raise RuntimeError("Could not find password input. Check SC_SEL_PASSWORD.")
-    await password_input.fill(password)
+        raise RuntimeError(
+            f"Could not find password input using selector {sel_password!r}. "
+            "Check SC_SEL_PASSWORD or see screenshots/."
+        )
+    logger.info(
+        "Password field — selector: %r  id=%r  name=%r  type=%r  placeholder=%r",
+        sel_password,
+        await password_input.get_attribute("id"),
+        await password_input.get_attribute("name"),
+        await password_input.get_attribute("type"),
+        await password_input.get_attribute("placeholder"),
+    )
+    await password_input.click()
+    await password_input.fill("")
+    await password_input.type(password, delay=50)
+    pw_readback_len = len(await password_input.input_value())
+    logger.info(
+        "Password typed: %s — readback length: %d — match: %s",
+        "*" * len(password), pw_readback_len, pw_readback_len == len(password),
+    )
     await _screenshot(page, "02_login_filled")
 
-    # reCAPTCHA requires manual interaction — pause and wait for the user.
+    # ---- reCAPTCHA pause ----
     print(
         "\n"
         "┌─────────────────────────────────────────────────────────────┐\n"
@@ -95,11 +135,66 @@ async def _login(page: Page, base_url: str, email: str, password: str, timeout_m
     )
     await asyncio.get_event_loop().run_in_executor(None, input)
 
+    # reCAPTCHA interaction can clear form fields — check and re-fill if needed
+    post_email = await email_input.input_value()
+    post_pw_len = len(await password_input.input_value())
+    logger.info(
+        "After reCAPTCHA — email: %r (ok: %s)  password length: %d (ok: %s)",
+        post_email, post_email == email, post_pw_len, post_pw_len == len(password),
+    )
+    if post_email != email:
+        logger.warning("Email was cleared by reCAPTCHA interaction — re-typing")
+        await email_input.click()
+        await email_input.fill("")
+        await email_input.type(email, delay=50)
+    if post_pw_len != len(password):
+        logger.warning("Password was cleared by reCAPTCHA interaction — re-typing")
+        await password_input.click()
+        await password_input.fill("")
+        await password_input.type(password, delay=50)
+
+    # ---- Submit ----
     submit_btn = page.locator(sel_submit).first
     if not await submit_btn.count():
-        raise RuntimeError("Could not find submit button. Check SC_SEL_SUBMIT.")
+        raise RuntimeError(
+            f"Could not find submit button using selector {sel_submit!r}. "
+            "Check SC_SEL_SUBMIT or see screenshots/."
+        )
+    logger.info(
+        "Submit button — selector: %r  id=%r  type=%r  value=%r  text=%r",
+        sel_submit,
+        await submit_btn.get_attribute("id"),
+        await submit_btn.get_attribute("type"),
+        await submit_btn.get_attribute("value"),
+        (await submit_btn.inner_text()).strip()[:60],
+    )
+
+    await _screenshot(page, "02b_pre_submit")
+    logger.info("Clicking Sign In — current URL: %s", page.url)
     await submit_btn.click()
-    await page.wait_for_url(lambda u: "sign_in" not in u, timeout=timeout_ms)
+    await _screenshot(page, "02c_post_submit_click")
+    logger.info("Sign In clicked — current URL: %s", page.url)
+
+    try:
+        await page.wait_for_url(lambda u: "sign_in" not in u, timeout=timeout_ms)
+    except Exception:
+        # Navigation didn't leave the sign-in page — scrape the error message
+        error_text = ""
+        for err_sel in (".alert", ".alert-danger", ".error", "#error_explanation",
+                        "[class*='error']", "[class*='alert']", ".flash", "p.invalid"):
+            el = page.locator(err_sel).first
+            if await el.count():
+                candidate = (await el.inner_text()).strip()
+                if candidate:
+                    error_text = candidate
+                    break
+        await _screenshot(page, "error_login_failed")
+        raise RuntimeError(
+            f"Login did not complete — still on {page.url!r}. "
+            f"Page error: {error_text!r}. "
+            "Check screenshots/ for browser state."
+        ) from None
+
     await _screenshot(page, "03_post_login")
     logger.info("Login successful: %s", page.url)
 
