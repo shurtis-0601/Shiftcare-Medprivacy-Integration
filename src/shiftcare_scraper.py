@@ -135,23 +135,38 @@ async def _login(page: Page, base_url: str, email: str, password: str, timeout_m
     )
     await asyncio.get_event_loop().run_in_executor(None, input)
 
-    # reCAPTCHA interaction can clear form fields — check and re-fill if needed
+    # Re-check email — readback works for text fields.
     post_email = await email_input.input_value()
-    post_pw_len = len(await password_input.input_value())
-    logger.info(
-        "After reCAPTCHA — email: %r (ok: %s)  password length: %d (ok: %s)",
-        post_email, post_email == email, post_pw_len, post_pw_len == len(password),
-    )
+    logger.info("After reCAPTCHA — email: %r (ok: %s)", post_email, post_email == email)
     if post_email != email:
-        logger.warning("Email was cleared by reCAPTCHA interaction — re-typing")
+        logger.info("Email was cleared — re-typing")
         await email_input.click()
         await email_input.fill("")
         await email_input.type(email, delay=50)
-    if post_pw_len != len(password):
-        logger.warning("Password was cleared by reCAPTCHA interaction — re-typing")
-        await password_input.click()
-        await password_input.fill("")
-        await password_input.type(password, delay=50)
+
+    # Always re-type password unconditionally.  Two reasons:
+    # 1. reCAPTCHA interaction reliably clears the password field.
+    # 2. input_value() returns "" for password fields regardless of content
+    #    (browser security), so readback cannot confirm whether the field
+    #    is filled — we cannot check, so we always re-type.
+    logger.info("Re-typing password after reCAPTCHA pause (always required)")
+    await password_input.click()
+    await password_input.fill("")
+    await password_input.type(password, delay=50)
+
+    # Untick "Remember me" if present and checked — session lifetime is
+    # managed by our own shiftcare_session.json, not the browser cookie.
+    rem_sel = _env(
+        "SC_SEL_REMEMBER_ME",
+        "input[type='checkbox'][name*='remember'], #user_remember_me",
+    )
+    remember_me = page.locator(rem_sel).first
+    if await remember_me.count():
+        if await remember_me.is_checked():
+            await remember_me.uncheck()
+            logger.info("Unchecked 'Remember me'")
+        else:
+            logger.info("'Remember me' already unchecked")
 
     # ---- Submit ----
     submit_btn = page.locator(sel_submit).first
