@@ -19,12 +19,13 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import os
 from datetime import date, datetime
 from pathlib import Path
 
-from playwright.async_api import async_playwright, Page
+from playwright.async_api import async_playwright, BrowserContext, Page
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +102,64 @@ async def _login(page: Page, base_url: str, email: str, password: str, timeout_m
     await page.wait_for_url(lambda u: "sign_in" not in u, timeout=timeout_ms)
     await _screenshot(page, "03_post_login")
     logger.info("Login successful: %s", page.url)
+
+
+# ---------------------------------------------------------------------------
+# Session persistence
+# ---------------------------------------------------------------------------
+
+async def _save_session(context: BrowserContext, session_path: Path) -> None:
+    """Persist all browser cookies to session_path as JSON."""
+    try:
+        cookies = await context.cookies()
+        session_path.write_text(json.dumps(cookies, indent=2), encoding="utf-8")
+        logger.info("Session saved: %d cookie(s) → %s", len(cookies), session_path)
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.warning("Could not save session to %s: %s", session_path, exc)
+
+
+async def _ensure_logged_in(
+    page: Page,
+    context: BrowserContext,
+    base_url: str,
+    email: str,
+    password: str,
+    session_path: Path,
+    timeout_ms: int,
+) -> None:
+    """
+    Restore a saved session if one exists and is still valid; otherwise run
+    the full manual login (with reCAPTCHA pause) and save the new session.
+
+    Session validity is checked by loading the cookies into the context and
+    navigating to the app root — if ShiftCare redirects to /users/sign_in the
+    session has expired and the full login flow runs instead.
+    """
+    if session_path.exists():
+        logger.info("Found session file: %s — attempting restore", session_path)
+        try:
+            cookies = json.loads(session_path.read_text(encoding="utf-8"))
+            await context.add_cookies(cookies)
+            logger.info("Loaded %d cookie(s) from %s", len(cookies), session_path)
+
+            await page.goto(base_url, timeout=timeout_ms)
+            await page.wait_for_load_state("networkidle", timeout=timeout_ms)
+            await _screenshot(page, "01_session_check")
+
+            if "sign_in" not in page.url:
+                logger.info("Session valid — login skipped")
+                return
+
+            logger.info("Session expired (redirected to %s) — running full login", page.url)
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.warning(
+                "Could not restore session from %s (%s) — running full login", session_path, exc
+            )
+    else:
+        logger.info("No session file at %s — running full login", session_path)
+
+    await _login(page, base_url, email, password, timeout_ms)
+    await _save_session(context, session_path)
 
 
 # ---------------------------------------------------------------------------
@@ -400,6 +459,7 @@ async def scrape_all_participants(
     # Set SHIFTCARE_HEADLESS=true only if you have an alternative auth flow.
     headless = _env("SHIFTCARE_HEADLESS", "false").lower() not in ("false", "0", "no")
     timeout_ms = _env_int("SC_NAV_TIMEOUT_MS", 30000)
+    session_path = Path(_env("SHIFTCARE_SESSION_PATH", "shiftcare_session.json"))
 
     saved_paths: list[Path] = []
 
@@ -409,7 +469,7 @@ async def scrape_all_participants(
         page = await context.new_page()
 
         try:
-            await _login(page, base_url, email, password, timeout_ms)
+            await _ensure_logged_in(page, context, base_url, email, password, session_path, timeout_ms)
             await _navigate_to_events_page(page, base_url, timeout_ms)
             participant_links = await _get_participant_links(page)
             events_page_url = page.url
