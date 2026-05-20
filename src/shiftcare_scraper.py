@@ -70,8 +70,8 @@ async def _login(page: Page, base_url: str, email: str, password: str, timeout_m
     sel_password = _env("SC_SEL_PASSWORD", "input[type='password'], input[name='password'], #user_password")
     sel_submit = _env("SC_SEL_SUBMIT", "input[type='submit'], button[type='submit']")
 
-    logger.info("Navigating to ShiftCare login: %s/users/sign_in", base_url)
-    await page.goto(f"{base_url}/users/sign_in", timeout=timeout_ms)
+    logger.info("Navigating to ShiftCare: %s (following redirect to login)", base_url)
+    await page.goto(base_url, timeout=timeout_ms)
     await page.wait_for_load_state("networkidle", timeout=timeout_ms)
     await _screenshot(page, "01_login_page")
     logger.info("Login page loaded: %s", page.url)
