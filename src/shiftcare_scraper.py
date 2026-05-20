@@ -84,6 +84,16 @@ async def _login(page: Page, base_url: str, email: str, password: str, timeout_m
     await password_input.fill(password)
     await _screenshot(page, "02_login_filled")
 
+    # reCAPTCHA requires manual interaction — pause and wait for the user.
+    print(
+        "\n"
+        "┌─────────────────────────────────────────────────────────────┐\n"
+        "│  Please tick the reCAPTCHA in the browser window, then      │\n"
+        "│  press Enter here to continue.                               │\n"
+        "└─────────────────────────────────────────────────────────────┘"
+    )
+    await asyncio.get_event_loop().run_in_executor(None, input)
+
     submit_btn = page.locator(sel_submit).first
     if not await submit_btn.count():
         raise RuntimeError("Could not find submit button. Check SC_SEL_SUBMIT.")
@@ -385,7 +395,10 @@ async def scrape_all_participants(
     input_dir.mkdir(parents=True, exist_ok=True)
 
     base_url = _env("SHIFTCARE_BASE_URL", "https://app.shiftcare.com").rstrip("/")
-    headless = _env("SHIFTCARE_HEADLESS", "true").lower() not in ("false", "0", "no")
+    # Default to visible browser — the reCAPTCHA on the login page requires
+    # manual interaction, so headless mode won't work without a CAPTCHA solver.
+    # Set SHIFTCARE_HEADLESS=true only if you have an alternative auth flow.
+    headless = _env("SHIFTCARE_HEADLESS", "false").lower() not in ("false", "0", "no")
     timeout_ms = _env_int("SC_NAV_TIMEOUT_MS", 30000)
 
     saved_paths: list[Path] = []
