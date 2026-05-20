@@ -184,31 +184,24 @@ def main() -> None:
         try:
             pdf_paths = run_scraper(sc_email, sc_password, input_dir, target_date, ref_map)
         except RuntimeError as exc:
-            logger.error("Scraper failed: %s", exc)
-            try:
-                notifier.send_pipeline_report(
-                    target_date,
-                    {"total": 0, "uploaded": 0, "quarantined": 0, "skipped": 0, "errors": 1},
-                    [],
-                    [{"note_id": "scraper", "error": str(exc)}],
-                )
-            except Exception:  # pylint: disable=broad-except
-                pass
-            run_logger.record_run(
-                run_date=target_date,
-                run_at=run_at,
-                notes_exported=0,
-                notes_processed=0,
-                notes_quarantined=0,
-                notes_skipped=0,
-                errors=[str(exc)],
-                csv_path="",
+            logger.warning(
+                "Scraper failed — will continue with any PDFs already in %s. Error: %s",
+                input_dir, exc,
             )
-            run_logger.upload_log(config)
-            sys.exit(1)
+            pdf_paths = _find_existing_pdfs(input_dir, target_date)
+            if pdf_paths:
+                logger.info(
+                    "Found %d PDF(s) already in %s — proceeding with those",
+                    len(pdf_paths), input_dir,
+                )
+            else:
+                logger.warning(
+                    "No PDFs in %s either — nothing to process for %s",
+                    input_dir, target_date,
+                )
 
     if not pdf_paths:
-        logger.warning("No PDFs downloaded for %s — nothing to process.", target_date)
+        logger.warning("No PDFs available for %s — exiting.", target_date)
         sys.exit(0)
 
     # Save any new PART-XXX assignments made during the scrape so that main._run()
