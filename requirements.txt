@@ -9,3 +9,4 @@ tenacity>=8.2.0
 pytz>=2024.1
 pdfplumber>=0.10.0
 playwright>=1.44.0
+playwright-stealth>=1.0.6

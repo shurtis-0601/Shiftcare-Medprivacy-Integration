@@ -26,6 +26,7 @@ from datetime import date, datetime
 from pathlib import Path
 
 from playwright.async_api import async_playwright, BrowserContext, Page
+from playwright_stealth import stealth_async
 
 logger = logging.getLogger(__name__)
 
@@ -675,6 +676,7 @@ async def scrape_all_participants(
         browser = await pw.chromium.launch(headless=headless)
         context = await browser.new_context(accept_downloads=True)
         page = await context.new_page()
+        await stealth_async(page)  # mask Playwright fingerprint from bot detection
 
         try:
             page = await _ensure_logged_in(page, context, base_url, email, password, session_path, timeout_ms)
